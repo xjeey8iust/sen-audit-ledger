@@ -45,6 +45,26 @@ go run .
 
 输入非法（JSON 畸形、非对象、多值、字段缺失或为 null、类型不符、字符串或时间非法、含禁止字段、显式 `seq` 非下一序号）返回 HTTP 400，`code` 为 `invalid_audit_input`；显式 `seq` 已存在返回 HTTP 409，`code` 为 `audit_seq_conflict`；存储不可用或提交失败返回 HTTP 503，`code` 为 `storage_unavailable`。
 
+### `GET /ledger/verify`
+
+校验整个账本。请求不接受任何查询参数。一次校验在同一个只读事务内按 `seq` 升序读取，针对同一个已提交视图；校验期间发生追加时，看到的是追加前或追加后的完整链，不会混合读取。
+
+逐条确认：序号从 1 起连续递增；首条记录的 `prev_hash` 为 64 个 `0`，其余记录的 `prev_hash` 等于上一条记录存储的 `hash`；并按追加入口相同的字段顺序（`seq、account、operation、resource、result、occurred_at、prev_hash`）与紧凑 JSON 数组编码，依据当前存储字段重新计算 SHA-256，与该条存储的 `hash` 比较（已存文本与时间的小数秒形式原样参与计算，含中文、引号、反斜杠和控制字符的合法记录同样通过）。
+
+发现首个不符合条件的记录即停止。`checked` 为已检查记录数，包含触发失败的那条现存记录；序号不等于期望序号时 `first_invalid_seq` 为期望序号，序号连续但前链值或自身 `hash` 不符时为该记录的序号。只保留合法链前缀的账本仍判定为有效。校验不修改任何记录、不补洞、不把重算值写回。
+
+正常完成（账本为空、全部通过或发现断链）均返回 HTTP 200：
+
+```json
+{"valid":true,"checked":0,"first_invalid_seq":null}
+```
+
+```json
+{"valid":false,"checked":3,"first_invalid_seq":3}
+```
+
+携带任何查询参数返回 HTTP 400，`code` 为 `invalid_audit_input`（参数非法优先于存储错误）；数据库不可用或读取失败返回 HTTP 503，`code` 为 `storage_unavailable`，不返回部分检查结果。
+
 ### `GET /healthz`
 
 返回服务与存储状态。正常时 HTTP 200：

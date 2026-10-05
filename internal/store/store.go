@@ -2,6 +2,7 @@
 package store
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -129,6 +130,68 @@ func (s *Store) Append(in EventInput) (Event, error) {
 		return Event{}, fmt.Errorf("commit append: %w", err)
 	}
 	return event, nil
+}
+
+// VerifyResult reports one full-ledger verification pass.
+type VerifyResult struct {
+	// Valid is true when the ledger is empty or every record read from the
+	// snapshot forms one continuous, correctly hashed chain.
+	Valid bool
+	// Checked is the number of records examined, including the record that
+	// triggered the first failure.
+	Checked int64
+	// FirstInvalidSeq is the sequence position of the first broken record, or
+	// nil when Valid is true. A seq mismatch returns the expected seq; a chain
+	// or hash mismatch returns the stored record's own seq.
+	FirstInvalidSeq *int64
+}
+
+// VerifyChain reads the whole ledger in one read-only transaction so the pass
+// sees a single committed snapshot; an append landing during the check yields
+// either the pre-append or the post-append chain, never a mix. Records are
+// examined in ascending seq, stopping at the first record that is not the next
+// expected sequence, does not chain to the previous record's stored hash, or
+// does not hash to its stored value. Verification never mutates records.
+func (s *Store) VerifyChain() (VerifyResult, error) {
+	tx, err := s.db.BeginTx(context.TODO(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return VerifyResult{}, fmt.Errorf("begin verify: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(
+		"SELECT seq, account, operation, resource, result, occurred_at, prev_hash, hash FROM events ORDER BY seq ASC",
+	)
+	if err != nil {
+		return VerifyResult{}, fmt.Errorf("read ledger: %w", err)
+	}
+	defer rows.Close()
+
+	var expected int64 = 1
+	prevHash := genesisPrevHash
+	var checked int64
+	for rows.Next() {
+		var e Event
+		if err := rows.Scan(&e.Seq, &e.Account, &e.Operation, &e.Resource, &e.Result, &e.OccurredAt, &e.PrevHash, &e.Hash); err != nil {
+			return VerifyResult{}, fmt.Errorf("scan event: %w", err)
+		}
+		checked++
+		if e.Seq != expected {
+			return VerifyResult{Valid: false, Checked: checked, FirstInvalidSeq: &expected}, nil
+		}
+		if e.PrevHash != prevHash || computeHash(e) != e.Hash {
+			return VerifyResult{Valid: false, Checked: checked, FirstInvalidSeq: &e.Seq}, nil
+		}
+		prevHash = e.Hash
+		expected++
+	}
+	if err := rows.Err(); err != nil {
+		return VerifyResult{}, fmt.Errorf("iterate ledger: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return VerifyResult{}, fmt.Errorf("commit verify: %w", err)
+	}
+	return VerifyResult{Valid: true, Checked: checked}, nil
 }
 
 // computeHash hashes the compact JSON array

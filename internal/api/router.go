@@ -17,6 +17,8 @@ func NewRouter(st *store.Store) *gin.Engine {
 
 	router.POST("/events", postEvent(st))
 
+	router.GET("/ledger/verify", getLedgerVerify(st))
+
 	router.GET("/healthz", func(c *gin.Context) {
 		if err := st.Ping(); err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": "storage_unavailable", "message": "database is not available"}})
