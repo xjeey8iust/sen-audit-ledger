@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -76,6 +77,14 @@ func parseEventInput(c *gin.Context) (store.EventInput, bool) {
 		return invalid()
 	}
 
+	// The body must be losslessly interpretable as Unicode before any JSON
+	// decoding runs: encoding/json would otherwise replace malformed UTF-8
+	// bytes and unpaired \u surrogate escapes with U+FFFD and let them through
+	// as normal audit content. This gate runs before seq checks and storage.
+	if !utf8.Valid(body) || !hasValidUnicodeEscapes(body) {
+		return invalid()
+	}
+
 	var raw map[string]json.RawMessage
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	if err := decoder.Decode(&raw); err != nil || raw == nil {
@@ -128,6 +137,113 @@ func parseEventInput(c *gin.Context) (store.EventInput, bool) {
 		input.Seq = &seq
 	}
 	return input, true
+}
+
+// hasValidUnicodeEscapes scans the raw bytes of a JSON document and reports
+// every \uXXXX escape inside JSON strings (field names included) to be
+// well-formed. A surrogate must be a complete pair with a high surrogate
+// (U+D800..U+DBFF) immediately followed by a low surrogate (U+DC00..U+DFFF);
+// a lone surrogate or a reversed pair is rejected. A backslash escaped as
+// "\\" starts no escape, so the literal text \\uD83D is never mistaken for a
+// Unicode escape, and pairing never crosses a string boundary. Malformed
+// escapes (\u short of four hex digits) are rejected here as well. The caller
+// is expected to have validated the document as UTF-8 and to run a strict JSON
+// decode afterwards; this routine only catches what that decode would repair.
+func hasValidUnicodeEscapes(body []byte) bool {
+	inString := false
+	// pendingHigh is set while a string's last \u escape was a high surrogate
+	// that the next escape must complete with a low surrogate.
+	pendingHigh := false
+	for i := 0; i < len(body); i++ {
+		b := body[i]
+		if !inString {
+			if b == '"' {
+				inString = true
+				pendingHigh = false
+			}
+			continue
+		}
+		switch b {
+		case '\\':
+			if i+1 >= len(body) {
+				return false
+			}
+			esc := body[i+1]
+			if esc != 'u' {
+				// A doubled backslash consumes both bytes and starts no
+				// escape, leaving any following "\uD83D" as literal text.
+				// It also cannot complete a pending surrogate pair.
+				if pendingHigh {
+					return false
+				}
+				i++
+				continue
+			}
+			r, ok := parseHex4(body, i+2)
+			if !ok {
+				return false
+			}
+			i += 5 // backslash, 'u' and four hex digits
+			switch {
+			case r >= 0xD800 && r <= 0xDBFF:
+				if pendingHigh {
+					// A high surrogate must be completed by a low one.
+					return false
+				}
+				pendingHigh = true
+			case r >= 0xDC00 && r <= 0xDFFF:
+				if !pendingHigh {
+					// A low surrogate with no preceding high surrogate.
+					return false
+				}
+				pendingHigh = false
+			default:
+				if pendingHigh {
+					// The high surrogate was paired with a non-surrogate.
+					return false
+				}
+			}
+		case '"':
+			if pendingHigh {
+				// The string ends while a high surrogate is unpaired.
+				return false
+			}
+			inString = false
+		default:
+			// A literal character (or an unescaped control byte, which the
+			// JSON decoder rejects separately) cannot complete a pair, so a
+			// pending high surrogate here is left unpaired.
+			if pendingHigh {
+				return false
+			}
+		}
+	}
+	return !inString && !pendingHigh
+}
+
+// parseHex4 reads four hexadecimal digits at body[pos:] and returns their
+// value. It returns false when fewer than four digits remain or any digit is
+// not hexadecimal.
+func parseHex4(body []byte, pos int) (rune, bool) {
+	if pos+4 > len(body) {
+		return 0, false
+	}
+	v := 0
+	for k := 0; k < 4; k++ {
+		c := body[pos+k]
+		switch {
+		case c >= '0' && c <= '9':
+			c -= '0'
+		case c >= 'a' && c <= 'f':
+			c -= 'a' - 10
+		case c >= 'A' && c <= 'F':
+			c -= 'A' - 10
+		default:
+			return 0, false
+		}
+		v = v<<4 | int(c)
+	}
+	return rune(v), true
 }
 
 // requiredString extracts a string field that must be present, non-null and

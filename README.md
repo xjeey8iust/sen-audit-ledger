@@ -26,7 +26,7 @@ go run .
 
 ### `POST /events`
 
-追加一条审计记录。请求体为 JSON 对象，`account`、`operation`、`resource`、`result`、`occurred_at` 为必填字符串（前四项去除两端空白后不能为空，存储时保留原文）；`occurred_at` 必须是带时区的 RFC3339 时间（拒绝闰秒），按 UTC 存储和返回并保留小数秒。`seq` 可省略，由服务分配；显式 `seq` 只接受不含小数及指数的正整数。请求禁止携带 `hash`、`prev_hash` 及任何未知字段。
+追加一条审计记录。请求体为 JSON 对象，`account`、`operation`、`resource`、`result`、`occurred_at` 为必填字符串（前四项去除两端空白后不能为空，存储时保留原文）；字符串内容必须是合法 Unicode：请求体含非法 UTF-8 字节，或 JSON 字符串（含字段名）中出现未配对高/低代理项、顺序颠倒的代理项等 `\u` 转义时一律拒绝，不会以 U+FFFD 替换后接受；合法的相邻代理对（如 `😀`）解码为它所表示的字符（😀），与直接提交该字符等价。`occurred_at` 必须是带时区的 RFC3339 时间（拒绝闰秒），按 UTC 存储和返回并保留小数秒。`seq` 可省略，由服务分配；显式 `seq` 只接受不含小数及指数的正整数。请求禁止携带 `hash`、`prev_hash` 及任何未知字段。
 
 成功时返回 HTTP 201 及完整记录（业务字段、`seq`、`prev_hash`、`hash`）。首条记录 `seq` 为 1、`prev_hash` 为 64 个 `0`；之后序号连续递增，`prev_hash` 等于上一条的 `hash`。`hash` 是对按 `seq、account、operation、resource、result、occurred_at、prev_hash` 顺序组成的紧凑 JSON 数组（UTF-8 字节）计算的 SHA-256 小写十六进制。
 
