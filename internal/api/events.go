@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -76,6 +77,13 @@ func parseEventInput(c *gin.Context) (store.EventInput, bool) {
 		return invalid()
 	}
 
+	// The JSON decoder silently rewrites invalid UTF-8 bytes and unpaired
+	// surrogate escapes to U+FFFD; the ledger must only store text that
+	// decodes losslessly, so reject both before decoding.
+	if !utf8.Valid(body) || hasUnpairedSurrogateEscape(body) {
+		return invalid()
+	}
+
 	var raw map[string]json.RawMessage
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	if err := decoder.Decode(&raw); err != nil || raw == nil {
@@ -128,6 +136,80 @@ func parseEventInput(c *gin.Context) (store.EventInput, bool) {
 		input.Seq = &seq
 	}
 	return input, true
+}
+
+// hasUnpairedSurrogateEscape scans the raw JSON document for \uXXXX escapes
+// inside string literals and reports whether any of them encodes a surrogate
+// that is not one half of an adjacent, correctly ordered pair. A high
+// surrogate must be followed immediately by a low-surrogate escape inside the
+// same string; a low surrogate on its own (or a reversed pair) is rejected.
+// Escaped backslashes are consumed first, so text like "\\uD83D" is read as
+// plain characters, not as a Unicode escape. Anything the scan cannot parse
+// is left for the JSON decoder to reject.
+func hasUnpairedSurrogateEscape(body []byte) bool {
+	inString := false
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if !inString {
+			if c == '"' {
+				inString = true
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = false
+		case '\\':
+			if i+1 >= len(body) || body[i+1] != 'u' {
+				// Any other escape (including \\) consumes one byte.
+				i++
+				continue
+			}
+			if i+6 > len(body) {
+				return false // truncated escape: malformed JSON
+			}
+			v, ok := parseHex4(body[i+2 : i+6])
+			if !ok {
+				return false // not hex: the decoder rejects it
+			}
+			switch {
+			case v >= 0xD800 && v <= 0xDBFF:
+				// A high surrogate is only valid as the first half of a
+				// pair immediately followed by a low-surrogate escape.
+				if i+12 <= len(body) && body[i+6] == '\\' && body[i+7] == 'u' {
+					if low, ok := parseHex4(body[i+8 : i+12]); ok && low >= 0xDC00 && low <= 0xDFFF {
+						i += 11
+						continue
+					}
+				}
+				return true
+			case v >= 0xDC00 && v <= 0xDFFF:
+				// A low surrogate without a preceding high surrogate.
+				return true
+			}
+			i += 5
+		}
+	}
+	return false
+}
+
+// parseHex4 reads exactly four hexadecimal digits, either case.
+func parseHex4(b []byte) (int, bool) {
+	v := 0
+	for _, c := range b {
+		v <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			v += int(c - '0')
+		case c >= 'a' && c <= 'f':
+			v += int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			v += int(c-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return v, true
 }
 
 // requiredString extracts a string field that must be present, non-null and

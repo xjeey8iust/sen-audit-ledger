@@ -48,7 +48,13 @@ func decodeEvent(t *testing.T, recorder *httptest.ResponseRecorder) map[string]a
 }
 
 func wantHash(seq int64, account, operation, resource, result, occurredAt, prevHash string) string {
-	payload := fmt.Sprintf(`[%d,"%s","%s","%s","%s","%s","%s"]`, seq, account, operation, resource, result, occurredAt, prevHash)
+	// Mirror the store's escaping: backslash and double quote are escaped,
+	// everything else in these test inputs stays raw.
+	escape := func(s string) string {
+		return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s)
+	}
+	payload := fmt.Sprintf(`[%d,"%s","%s","%s","%s","%s","%s"]`, seq,
+		escape(account), escape(operation), escape(resource), escape(result), escape(occurredAt), escape(prevHash))
 	sum := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(sum[:])
 }
@@ -272,6 +278,7 @@ func TestPostEventStorageFailureReturns503(t *testing.T) {
 // storedEvent is one row read back from the events table.
 type storedEvent struct {
 	seq        int64
+	account    string
 	occurredAt string
 	prevHash   string
 	hash       string
@@ -286,7 +293,7 @@ func readStoredEvents(t *testing.T, path string) []storedEvent {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	defer db.Close()
-	rows, err := db.Query("SELECT seq, occurred_at, prev_hash, hash FROM events ORDER BY seq")
+	rows, err := db.Query("SELECT seq, account, occurred_at, prev_hash, hash FROM events ORDER BY seq")
 	if err != nil {
 		t.Fatalf("query events: %v", err)
 	}
@@ -294,7 +301,7 @@ func readStoredEvents(t *testing.T, path string) []storedEvent {
 	var events []storedEvent
 	for rows.Next() {
 		var e storedEvent
-		if err := rows.Scan(&e.seq, &e.occurredAt, &e.prevHash, &e.hash); err != nil {
+		if err := rows.Scan(&e.seq, &e.account, &e.occurredAt, &e.prevHash, &e.hash); err != nil {
 			t.Fatalf("scan event: %v", err)
 		}
 		events = append(events, e)
@@ -305,9 +312,9 @@ func readStoredEvents(t *testing.T, path string) []storedEvent {
 	return events
 }
 
-// wantInvalidTime posts one event body and asserts the invalid_audit_input
+// wantInvalidInput posts one event body and asserts the invalid_audit_input
 // rejection shape: 400, only a top-level error object, and no internals.
-func wantInvalidTime(t *testing.T, router http.Handler, body string) {
+func wantInvalidInput(t *testing.T, router http.Handler, body string) {
 	t.Helper()
 	recorder := postEventBody(t, router, body)
 	if recorder.Code != http.StatusBadRequest {
@@ -345,7 +352,7 @@ func TestPostEventRejectsUTCYearOutOfRange(t *testing.T) {
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
 			router := NewRouter(openTestStore(t))
-			wantInvalidTime(t, router, body)
+			wantInvalidInput(t, router, body)
 		})
 	}
 }
@@ -360,9 +367,9 @@ func TestPostEventRejectsOutOfRangeTimeBeforeSeqChecks(t *testing.T) {
 
 	// An out-of-range occurred_at is invalid input no matter what seq says.
 	existing := `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"0000-01-01T00:00:00+00:01","seq":1}`
-	wantInvalidTime(t, router, existing)
+	wantInvalidInput(t, router, existing)
 	gap := `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"9999-12-31T23:59:59-00:01","seq":9}`
-	wantInvalidTime(t, router, gap)
+	wantInvalidInput(t, router, gap)
 }
 
 func TestPostEventAcceptsBoundaryUTCYear(t *testing.T) {
@@ -453,9 +460,9 @@ func TestPostEventRejectedTimeLeavesChainUntouched(t *testing.T) {
 	router := NewRouter(st)
 
 	// Out-of-range times, with and without seq, are all rejected.
-	wantInvalidTime(t, router, `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"0000-01-01T00:00:00+00:01"}`)
-	wantInvalidTime(t, router, `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"9999-12-31T23:59:59-00:01","seq":1}`)
-	wantInvalidTime(t, router, `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"9999-12-31T23:59:59-00:01","seq":9}`)
+	wantInvalidInput(t, router, `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"0000-01-01T00:00:00+00:01"}`)
+	wantInvalidInput(t, router, `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"9999-12-31T23:59:59-00:01","seq":1}`)
+	wantInvalidInput(t, router, `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"9999-12-31T23:59:59-00:01","seq":9}`)
 
 	// The rejections consumed no sequence number and moved no chain tail.
 	recorder := postEventBody(t, router, validEventBody())
@@ -490,5 +497,151 @@ func TestPostEventRejectedTimeLeavesChainUntouched(t *testing.T) {
 	stored = readStoredEvents(t, path)
 	if len(stored) != 2 || stored[1].hash != second["hash"] {
 		t.Fatalf("stored events after reopen = %+v", stored)
+	}
+}
+
+func TestPostEventRejectsInvalidUTF8(t *testing.T) {
+	cases := map[string]string{
+		"invalid byte in value":     `{"account":"a` + "\xff" + `","operation":"o","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z"}`,
+		"truncated multibyte value": `{"account":"` + "\xe4\xb8" + `","operation":"o","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z"}`,
+		"invalid byte in key":       `{"acc` + "\xff" + `ount":"a","operation":"o","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z"}`,
+		"overlong encoding":         `{"account":"` + "\xc0\xaf" + `","operation":"o","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z"}`,
+		"utf8 encoded surrogate":    `{"account":"` + "\xed\xa0\x80" + `","operation":"o","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z"}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			router := NewRouter(openTestStore(t))
+			wantInvalidInput(t, router, body)
+		})
+	}
+}
+
+func TestPostEventRejectsUnpairedSurrogates(t *testing.T) {
+	cases := map[string]string{
+		"lone high surrogate":       `{"account":"\uD83D","operation":"o","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z"}`,
+		"lone low surrogate":        `{"account":"\uDE00","operation":"o","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z"}`,
+		"reversed pair":             `{"account":"\uDE00\uD83D","operation":"o","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z"}`,
+		"high then non surrogate":   `{"account":"\uD83DA","operation":"o","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z"}`,
+		"high at end of string":     `{"account":"a\uD83D","operation":"o","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z"}`,
+		"surrogates across strings": `{"account":"\uD83D","operation":"\uDE00","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z"}`,
+		"lowercase hex":             `{"account":"\ud83d","operation":"o","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z"}`,
+		"surrogate in occurred_at":  `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z\uD83D"}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			router := NewRouter(openTestStore(t))
+			wantInvalidInput(t, router, body)
+		})
+	}
+}
+
+func TestPostEventAcceptsValidUnicode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "service.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+	router := NewRouter(st)
+
+	cases := []struct {
+		name        string
+		accountJSON string // JSON literal used for the account field
+		wantAccount string // decoded text the ledger must store verbatim
+	}{
+		{"direct chinese", `"账号"`, "账号"},
+		{"escaped chinese", `"\u8d26\u53f7"`, "账号"},
+		{"direct supplementary plane", `"😀"`, "😀"},
+		{"escaped supplementary plane", `"\uD83D\uDE00"`, "😀"},
+		{"escaped supplementary plane lowercase", `"\ud83d\ude00"`, "😀"},
+		{"direct replacement char", `"�"`, "�"},
+		{"escaped replacement char", `"\ufffd"`, "�"},
+		{"escaped backslash text", `"\\uD83D"`, `\uD83D`},
+	}
+	prevHash := strings.Repeat("0", 64)
+	for i, tc := range cases {
+		body := `{"account":` + tc.accountJSON + `,"operation":"o","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z"}`
+		recorder := postEventBody(t, router, body)
+		if recorder.Code != http.StatusCreated {
+			t.Fatalf("%s: status = %d (%s)", tc.name, recorder.Code, recorder.Body.String())
+		}
+		event := decodeEvent(t, recorder)
+		if event["account"] != tc.wantAccount {
+			t.Fatalf("%s: account = %q, want %q", tc.name, event["account"], tc.wantAccount)
+		}
+		// The hash is computed over the decoded text, so an escaped
+		// surrogate pair and the same character submitted directly
+		// produce identical hashes at identical chain positions.
+		seq := int64(i + 1)
+		want := wantHash(seq, tc.wantAccount, "o", "r", "ok", "2026-10-05T00:00:00Z", prevHash)
+		if event["hash"] != want {
+			t.Fatalf("%s: hash = %v, want %v", tc.name, event["hash"], want)
+		}
+		prevHash = event["hash"].(string)
+	}
+
+	// What was persisted matches the decoded text exactly.
+	stored := readStoredEvents(t, path)
+	if len(stored) != len(cases) {
+		t.Fatalf("stored %d events, want %d", len(stored), len(cases))
+	}
+	for i, tc := range cases {
+		if stored[i].account != tc.wantAccount {
+			t.Fatalf("%s: stored account = %q, want %q", tc.name, stored[i].account, tc.wantAccount)
+		}
+	}
+}
+
+func TestPostEventRejectedEncodingLeavesChainUntouched(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "service.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+	router := NewRouter(st)
+
+	// One valid record so seq 1 exists and seq 9 is a gap.
+	seed := postEventBody(t, router, validEventBody())
+	if seed.Code != http.StatusCreated {
+		t.Fatalf("seed: status = %d (%s)", seed.Code, seed.Body.String())
+	}
+	first := decodeEvent(t, seed)
+
+	// Invalid UTF-8 bytes and unpaired surrogates are rejected no matter
+	// what seq the request carries: omitted, already existing, or a gap.
+	accounts := []string{
+		`"a` + "\xff" + `"`,    // invalid UTF-8 byte
+		`"` + "\xe4\xb8" + `"`, // truncated multibyte character
+		`"\uD83D"`,             // lone high surrogate
+		`"\uDE00"`,             // lone low surrogate
+		`"\uDE00\uD83D"`,       // reversed pair
+	}
+	for _, account := range accounts {
+		for _, seq := range []string{"", `,"seq":1`, `,"seq":9`} {
+			body := `{"account":` + account +
+				`,"operation":"o","resource":"r","result":"ok","occurred_at":"2026-10-05T00:00:00Z"` + seq + `}`
+			wantInvalidInput(t, router, body)
+		}
+	}
+
+	// The rejections consumed no sequence number and moved no chain tail.
+	stored := readStoredEvents(t, path)
+	if len(stored) != 1 || stored[0].hash != first["hash"] {
+		t.Fatalf("stored events = %+v, want only the seed record", stored)
+	}
+
+	// The next valid append continues from the original chain tail.
+	recorder := postEventBody(t, router, validEventBody())
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d (%s)", recorder.Code, recorder.Body.String())
+	}
+	second := decodeEvent(t, recorder)
+	if second["seq"] != float64(2) || second["prev_hash"] != first["hash"] {
+		t.Fatalf("next = %v, want seq 2 chained to %v", second, first["hash"])
+	}
+	stored = readStoredEvents(t, path)
+	if len(stored) != 2 || stored[1].hash != second["hash"] {
+		t.Fatalf("stored events after valid append = %+v", stored)
 	}
 }
