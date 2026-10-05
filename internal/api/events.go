@@ -231,6 +231,10 @@ func normalizeOccurredAt(value string) (string, bool) {
 		return "", false
 	}
 	utc := t.Add(time.Duration(-offsetMinutes) * time.Minute)
+	if utc.Year() < 0 || utc.Year() > 9999 {
+		// The UTC form must stay a four-digit RFC3339 year.
+		return "", false
+	}
 	return utc.Format("2006-01-02T15:04:05") + fraction + "Z", true
 }
 

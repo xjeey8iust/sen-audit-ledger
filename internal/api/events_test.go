@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -265,5 +266,229 @@ func TestPostEventStorageFailureReturns503(t *testing.T) {
 	}
 	if event := decodeEvent(t, recorder); event["error"].(map[string]any)["code"] != "storage_unavailable" {
 		t.Fatalf("body = %v", event)
+	}
+}
+
+// storedEvent is one row read back from the events table.
+type storedEvent struct {
+	seq        int64
+	occurredAt string
+	prevHash   string
+	hash       string
+}
+
+// readStoredEvents opens the database file directly and returns every
+// persisted record in seq order, so tests verify what was actually saved.
+func readStoredEvents(t *testing.T, path string) []storedEvent {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	rows, err := db.Query("SELECT seq, occurred_at, prev_hash, hash FROM events ORDER BY seq")
+	if err != nil {
+		t.Fatalf("query events: %v", err)
+	}
+	defer rows.Close()
+	var events []storedEvent
+	for rows.Next() {
+		var e storedEvent
+		if err := rows.Scan(&e.seq, &e.occurredAt, &e.prevHash, &e.hash); err != nil {
+			t.Fatalf("scan event: %v", err)
+		}
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate events: %v", err)
+	}
+	return events
+}
+
+// wantInvalidTime posts one event body and asserts the invalid_audit_input
+// rejection shape: 400, only a top-level error object, and no internals.
+func wantInvalidTime(t *testing.T, router http.Handler, body string) {
+	t.Helper()
+	recorder := postEventBody(t, router, body)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d (%s)", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	decoded := decodeEvent(t, recorder)
+	if len(decoded) != 1 {
+		t.Fatalf("response keys = %v, want only the error object", decoded)
+	}
+	errObj, ok := decoded["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("error = %v, want an object", decoded["error"])
+	}
+	if errObj["code"] != "invalid_audit_input" {
+		t.Fatalf("code = %v, want invalid_audit_input", errObj["code"])
+	}
+	if message, ok := errObj["message"].(string); !ok || message == "" {
+		t.Fatalf("message = %v, want a non-empty string", errObj["message"])
+	}
+	leaks := []string{"sql", "SELECT", "INSERT", "goroutine", ".go", "/", "\\"}
+	for _, leak := range leaks {
+		if strings.Contains(recorder.Body.String(), leak) {
+			t.Fatalf("response leaks internals (%q): %s", leak, recorder.Body.String())
+		}
+	}
+}
+
+func TestPostEventRejectsUTCYearOutOfRange(t *testing.T) {
+	cases := map[string]string{
+		"below year 0000":          `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"0000-01-01T00:00:00+00:01"}`,
+		"below year 0000 fraction": `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"0000-01-01T00:00:00.5+00:01"}`,
+		"above year 9999":          `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"9999-12-31T23:59:59-00:01"}`,
+		"above year 9999 fraction": `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"9999-12-31T23:59:59.5-00:01"}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			router := NewRouter(openTestStore(t))
+			wantInvalidTime(t, router, body)
+		})
+	}
+}
+
+func TestPostEventRejectsOutOfRangeTimeBeforeSeqChecks(t *testing.T) {
+	router := NewRouter(openTestStore(t))
+
+	// One valid record so seq 1 exists and seq 9 is a gap.
+	if recorder := postEventBody(t, router, validEventBody()); recorder.Code != http.StatusCreated {
+		t.Fatalf("seed: status = %d (%s)", recorder.Code, recorder.Body.String())
+	}
+
+	// An out-of-range occurred_at is invalid input no matter what seq says.
+	existing := `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"0000-01-01T00:00:00+00:01","seq":1}`
+	wantInvalidTime(t, router, existing)
+	gap := `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"9999-12-31T23:59:59-00:01","seq":9}`
+	wantInvalidTime(t, router, gap)
+}
+
+func TestPostEventAcceptsBoundaryUTCYear(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "service.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+	router := NewRouter(st)
+
+	cases := []struct {
+		occurredAt string
+		wantUTC    string
+	}{
+		// One minute inside the lower bound: UTC lands exactly on 0000-01-01T00:00:00Z.
+		{"0000-01-01T00:01:00+00:01", "0000-01-01T00:00:00Z"},
+		// One minute inside the upper bound: UTC lands exactly on 9999-12-31T23:59:59Z.
+		{"9999-12-31T23:58:59-00:01", "9999-12-31T23:59:59Z"},
+	}
+	prevHash := strings.Repeat("0", 64)
+	for i, tc := range cases {
+		recorder := postEventBody(t, router,
+			fmt.Sprintf(`{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":%q}`, tc.occurredAt))
+		if recorder.Code != http.StatusCreated {
+			t.Fatalf("%s: status = %d (%s)", tc.occurredAt, recorder.Code, recorder.Body.String())
+		}
+		event := decodeEvent(t, recorder)
+		if event["occurred_at"] != tc.wantUTC {
+			t.Fatalf("%s: occurred_at = %v, want %v", tc.occurredAt, event["occurred_at"], tc.wantUTC)
+		}
+		seq := int64(i + 1)
+		if event["seq"] != float64(seq) {
+			t.Fatalf("%s: seq = %v, want %d", tc.occurredAt, event["seq"], seq)
+		}
+		want := wantHash(seq, "a", "o", "r", "ok", tc.wantUTC, prevHash)
+		if event["hash"] != want {
+			t.Fatalf("%s: hash = %v, want %v (normalized time must feed the hash)", tc.occurredAt, event["hash"], want)
+		}
+		prevHash = event["hash"].(string)
+	}
+
+	// The persisted rows carry the same normalized UTC timestamps.
+	stored := readStoredEvents(t, path)
+	if len(stored) != len(cases) {
+		t.Fatalf("stored %d events, want %d", len(stored), len(cases))
+	}
+	for i, tc := range cases {
+		if stored[i].occurredAt != tc.wantUTC {
+			t.Fatalf("stored occurred_at = %v, want %v", stored[i].occurredAt, tc.wantUTC)
+		}
+	}
+}
+
+func TestPostEventOffsetConversionAcrossBoundaries(t *testing.T) {
+	router := NewRouter(openTestStore(t))
+
+	cases := []struct {
+		occurredAt string
+		wantUTC    string
+	}{
+		{"2026-10-05T00:30:00+08:00", "2026-10-04T16:30:00Z"},           // cross day
+		{"2026-03-01T00:15:00+05:30", "2026-02-28T18:45:00Z"},           // cross month
+		{"2026-01-01T00:30:00+08:00", "2025-12-31T16:30:00Z"},           // cross year
+		{"2026-10-05T01:00:00.2500+08:00", "2026-10-04T17:00:00.2500Z"}, // fraction digits and trailing zeros kept
+		{"2026-10-05T08:30:00Z", "2026-10-05T08:30:00Z"},                // Z input unchanged
+		{"2026-10-04T23:00:00-02:00", "2026-10-05T01:00:00Z"},           // negative offset forward
+	}
+	for _, tc := range cases {
+		recorder := postEventBody(t, router,
+			fmt.Sprintf(`{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":%q}`, tc.occurredAt))
+		if recorder.Code != http.StatusCreated {
+			t.Fatalf("%s: status = %d (%s)", tc.occurredAt, recorder.Code, recorder.Body.String())
+		}
+		if event := decodeEvent(t, recorder); event["occurred_at"] != tc.wantUTC {
+			t.Fatalf("%s: occurred_at = %v, want %v", tc.occurredAt, event["occurred_at"], tc.wantUTC)
+		}
+	}
+}
+
+func TestPostEventRejectedTimeLeavesChainUntouched(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "service.db")
+
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	router := NewRouter(st)
+
+	// Out-of-range times, with and without seq, are all rejected.
+	wantInvalidTime(t, router, `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"0000-01-01T00:00:00+00:01"}`)
+	wantInvalidTime(t, router, `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"9999-12-31T23:59:59-00:01","seq":1}`)
+	wantInvalidTime(t, router, `{"account":"a","operation":"o","resource":"r","result":"ok","occurred_at":"9999-12-31T23:59:59-00:01","seq":9}`)
+
+	// The rejections consumed no sequence number and moved no chain tail.
+	recorder := postEventBody(t, router, validEventBody())
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d (%s)", recorder.Code, recorder.Body.String())
+	}
+	first := decodeEvent(t, recorder)
+	if first["seq"] != float64(1) || first["prev_hash"] != strings.Repeat("0", 64) {
+		t.Fatalf("first = %v, want seq 1 chained to genesis", first)
+	}
+	st.Close()
+
+	// Only the valid append was persisted.
+	stored := readStoredEvents(t, path)
+	if len(stored) != 1 {
+		t.Fatalf("stored %d events, want 1", len(stored))
+	}
+	if stored[0].seq != 1 || stored[0].occurredAt != "2026-10-05T00:30:00Z" || stored[0].hash != first["hash"] {
+		t.Fatalf("stored event = %+v, want the valid append", stored[0])
+	}
+
+	// After a close and reopen the chain continues from the same tail.
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer st.Close()
+	second := decodeEvent(t, postEventBody(t, NewRouter(st), validEventBody()))
+	if second["seq"] != float64(2) || second["prev_hash"] != first["hash"] {
+		t.Fatalf("after reopen: seq = %v prev_hash = %v, want 2 and %v", second["seq"], second["prev_hash"], first["hash"])
+	}
+	stored = readStoredEvents(t, path)
+	if len(stored) != 2 || stored[1].hash != second["hash"] {
+		t.Fatalf("stored events after reopen = %+v", stored)
 	}
 }
