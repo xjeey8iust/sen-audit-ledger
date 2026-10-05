@@ -194,6 +194,120 @@ func (s *Store) VerifyChain() (VerifyResult, error) {
 	return VerifyResult{Valid: true, Checked: checked}, nil
 }
 
+// EventFilter narrows the records ListEvents returns. Account and the time
+// bounds are optional: a nil pointer applies no constraint. From and To must
+// already be normalized UTC timestamps in the stored occurred_at format.
+type EventFilter struct {
+	Account  *string // exact, case-sensitive match on the stored text
+	From     *string // inclusive lower bound on the instant
+	To       *string // exclusive upper bound on the instant
+	AfterSeq int64   // only records with a seq greater than this
+	Limit    int64   // page size; ListEvents reads at most Limit+1 matches
+}
+
+// ListEvents reads one page of the ledger in ascending seq inside a single
+// read-only transaction, so the page reflects one committed view; records
+// appended afterwards are visible to later pages, never to this one. At most
+// Limit+1 matching records are returned: a result longer than Limit means
+// more matches exist past the page. Listing never mutates records.
+func (s *Store) ListEvents(f EventFilter) ([]Event, error) {
+	tx, err := s.db.BeginTx(context.TODO(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin list: %w", err)
+	}
+	defer tx.Rollback()
+
+	query := "SELECT seq, account, operation, resource, result, occurred_at, prev_hash, hash FROM events WHERE seq > ?"
+	args := []any{f.AfterSeq}
+	if f.Account != nil {
+		query += " AND account = ?"
+		args = append(args, *f.Account)
+	}
+	// The second prefix is a conservative prefilter only: a record at or
+	// after From keeps a second prefix no smaller than From's, and a record
+	// before To keeps one no larger than To's. The exact instant check below
+	// decides, so fractional seconds of any length stay in the comparison.
+	if f.From != nil {
+		query += " AND substr(occurred_at, 1, 19) >= ?"
+		args = append(args, secondPrefix(*f.From))
+	}
+	if f.To != nil {
+		query += " AND substr(occurred_at, 1, 19) <= ?"
+		args = append(args, secondPrefix(*f.To))
+	}
+	query += " ORDER BY seq ASC"
+
+	rows, err := tx.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query events: %w", err)
+	}
+	defer rows.Close()
+
+	events := []Event{}
+	for rows.Next() && int64(len(events)) <= f.Limit {
+		var e Event
+		if err := rows.Scan(&e.Seq, &e.Account, &e.Operation, &e.Resource, &e.Result, &e.OccurredAt, &e.PrevHash, &e.Hash); err != nil {
+			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		if f.From != nil && CompareInstants(e.OccurredAt, *f.From) < 0 {
+			continue
+		}
+		if f.To != nil && CompareInstants(e.OccurredAt, *f.To) >= 0 {
+			continue
+		}
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate events: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close events: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit list: %w", err)
+	}
+	return events, nil
+}
+
+// CompareInstants orders two normalized UTC occurred_at values by the actual
+// instant they denote. Fractional seconds of any length participate: the
+// shorter fraction is right-padded with zeros, so ".5" and ".50" are equal
+// while ".5001" sorts after both. Different spellings of one instant compare
+// equal because both values are already normalized to UTC.
+func CompareInstants(a, b string) int {
+	aSec, bSec := secondPrefix(a), secondPrefix(b)
+	if aSec != bSec {
+		if aSec < bSec {
+			return -1
+		}
+		return 1
+	}
+	aFrac, bFrac := fractionDigits(a), fractionDigits(b)
+	if len(aFrac) < len(bFrac) {
+		aFrac += strings.Repeat("0", len(bFrac)-len(aFrac))
+	} else {
+		bFrac += strings.Repeat("0", len(aFrac)-len(bFrac))
+	}
+	return strings.Compare(aFrac, bFrac)
+}
+
+// secondPrefix returns the fixed-width "YYYY-MM-DDTHH:MM:SS" head of a
+// normalized UTC occurred_at value. The head is zero-padded, so lexicographic
+// order on it matches chronological order.
+func secondPrefix(value string) string {
+	return value[:len("2006-01-02T15:04:05")]
+}
+
+// fractionDigits returns the fractional-second digits of a normalized UTC
+// occurred_at value, or "" when the value carries no fraction.
+func fractionDigits(value string) string {
+	rest := value[len("2006-01-02T15:04:05"):]
+	if rest == "Z" {
+		return ""
+	}
+	return rest[1 : len(rest)-1] // strip the leading "." and trailing "Z"
+}
+
 // computeHash hashes the compact JSON array
 // [seq, account, operation, resource, result, occurred_at, prev_hash] encoded
 // as UTF-8. Strings escape only the double quote, the backslash and control

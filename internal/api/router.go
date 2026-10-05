@@ -17,6 +17,8 @@ func NewRouter(st *store.Store) *gin.Engine {
 
 	router.POST("/events", postEvent(st))
 
+	router.GET("/events", getEvents(st))
+
 	router.GET("/ledger/verify", getLedgerVerify(st))
 
 	router.GET("/healthz", func(c *gin.Context) {
