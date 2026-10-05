@@ -48,10 +48,28 @@ func decodeEvent(t *testing.T, recorder *httptest.ResponseRecorder) map[string]a
 }
 
 func wantHash(seq int64, account, operation, resource, result, occurredAt, prevHash string) string {
-	// Mirror the store's escaping: backslash and double quote are escaped,
-	// everything else in these test inputs stays raw.
+	// Independently implement the public hash rule from README.md: SHA-256
+	// over the compact JSON array, where strings escape only the double
+	// quote and the backslash directly, other control bytes as lowercase
+	// \u00xx, and everything else stays raw UTF-8.
 	escape := func(s string) string {
-		return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s)
+		const hexdigits = "0123456789abcdef"
+		var b strings.Builder
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			switch {
+			case c == '"' || c == '\\':
+				b.WriteByte('\\')
+				b.WriteByte(c)
+			case c < 0x20:
+				b.WriteString(`\u00`)
+				b.WriteByte(hexdigits[c>>4])
+				b.WriteByte(hexdigits[c&0x0f])
+			default:
+				b.WriteByte(c)
+			}
+		}
+		return b.String()
 	}
 	payload := fmt.Sprintf(`[%d,"%s","%s","%s","%s","%s","%s"]`, seq,
 		escape(account), escape(operation), escape(resource), escape(result), escape(occurredAt), escape(prevHash))
