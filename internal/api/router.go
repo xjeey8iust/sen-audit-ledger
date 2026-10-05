@@ -16,6 +16,7 @@ func NewRouter(st *store.Store) *gin.Engine {
 	router.Use(gin.Recovery())
 
 	router.POST("/events", postEvent(st))
+	router.GET("/ledger/verify", getLedgerVerify(st))
 
 	router.GET("/healthz", func(c *gin.Context) {
 		if err := st.Ping(); err != nil {

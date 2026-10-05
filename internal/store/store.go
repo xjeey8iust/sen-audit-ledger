@@ -131,6 +131,68 @@ func (s *Store) Append(in EventInput) (Event, error) {
 	return event, nil
 }
 
+// VerifyResult reports the outcome of a full ledger chain check. Checked
+// counts every record examined, including the one that triggered a failure.
+// FirstInvalidSeq is nil when the chain is valid; on a sequence break it
+// holds the expected (missing) seq, on a linkage or hash mismatch it holds
+// the offending record's own seq.
+type VerifyResult struct {
+	Valid           bool
+	Checked         int64
+	FirstInvalidSeq *int64
+}
+
+// Verify walks the whole ledger in ascending seq order against one committed
+// snapshot: a single read transaction, so appends committing mid-check are
+// seen either fully before or fully after, never mixed. It confirms seqs
+// increment contiguously from 1, that each prev_hash links to the previous
+// stored hash (genesis for the first record), and that each stored hash
+// matches a recomputation from the stored fields. The walk stops at the
+// first violation and never writes back.
+func (s *Store) Verify() (VerifyResult, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return VerifyResult{}, fmt.Errorf("begin verify: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query("SELECT seq, account, operation, resource, result, occurred_at, prev_hash, hash FROM events ORDER BY seq ASC")
+	if err != nil {
+		return VerifyResult{}, fmt.Errorf("read ledger: %w", err)
+	}
+	defer rows.Close()
+
+	result := VerifyResult{Valid: true}
+	var expectedSeq int64 = 1
+	prevHash := genesisPrevHash
+	for rows.Next() {
+		var event Event
+		if err := rows.Scan(&event.Seq, &event.Account, &event.Operation, &event.Resource,
+			&event.Result, &event.OccurredAt, &event.PrevHash, &event.Hash); err != nil {
+			return VerifyResult{}, fmt.Errorf("scan event: %w", err)
+		}
+		result.Checked++
+		if event.Seq != expectedSeq {
+			result.Valid = false
+			seq := expectedSeq
+			result.FirstInvalidSeq = &seq
+			return result, nil
+		}
+		if event.PrevHash != prevHash || computeHash(event) != event.Hash {
+			result.Valid = false
+			seq := event.Seq
+			result.FirstInvalidSeq = &seq
+			return result, nil
+		}
+		prevHash = event.Hash
+		expectedSeq++
+	}
+	if err := rows.Err(); err != nil {
+		return VerifyResult{}, fmt.Errorf("iterate ledger: %w", err)
+	}
+	return result, nil
+}
+
 // computeHash hashes the compact JSON array
 // [seq, account, operation, resource, result, occurred_at, prev_hash] encoded
 // as UTF-8. Strings escape only the double quote, the backslash and control
