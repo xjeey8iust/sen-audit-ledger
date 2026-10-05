@@ -194,6 +194,111 @@ func (s *Store) VerifyChain() (VerifyResult, error) {
 	return VerifyResult{Valid: true, Checked: checked}, nil
 }
 
+// EventFilter carries the validated bounds of one GET /events page. From and
+// To are normalized UTC timestamps in the same form records store; HasFrom
+// and HasTo mark whether each bound applies. A nil Account matches every
+// account.
+type EventFilter struct {
+	Account  *string
+	From     string
+	HasFrom  bool
+	To       string
+	HasTo    bool
+	AfterSeq int64
+	Limit    int
+}
+
+// ListEvents returns up to Limit records matching the filter in ascending
+// seq, plus whether further matching records exist beyond the page. The read
+// runs inside one read-only transaction, so the page reflects a single
+// committed view of the ledger; records appended afterwards only show up in
+// later requests. Listing never mutates records.
+func (s *Store) ListEvents(f EventFilter) ([]Event, bool, error) {
+	tx, err := s.db.BeginTx(context.TODO(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, false, fmt.Errorf("begin list: %w", err)
+	}
+	defer tx.Rollback()
+
+	query := "SELECT seq, account, operation, resource, result, occurred_at, prev_hash, hash FROM events WHERE seq > ?"
+	args := []any{f.AfterSeq}
+	if f.Account != nil {
+		// TEXT equality uses the binary collation: case-sensitive and exact,
+		// so the stored text must match the filter byte for byte.
+		query += " AND account = ?"
+		args = append(args, *f.Account)
+	}
+	query += " ORDER BY seq ASC"
+
+	rows, err := tx.Query(query, args...)
+	if err != nil {
+		return nil, false, fmt.Errorf("query events: %w", err)
+	}
+	defer rows.Close()
+
+	events := make([]Event, 0, f.Limit)
+	hasMore := false
+	for rows.Next() {
+		var e Event
+		if err := rows.Scan(&e.Seq, &e.Account, &e.Operation, &e.Resource, &e.Result, &e.OccurredAt, &e.PrevHash, &e.Hash); err != nil {
+			return nil, false, fmt.Errorf("scan event: %w", err)
+		}
+		// occurred_at is compared as an instant, not as text: fractions of
+		// any length participate and equal instants written differently
+		// (".5" vs ".50") must both fall inside or outside the window.
+		if f.HasFrom && CompareInstants(e.OccurredAt, f.From) < 0 {
+			continue
+		}
+		if f.HasTo && CompareInstants(e.OccurredAt, f.To) >= 0 {
+			continue
+		}
+		if len(events) == f.Limit {
+			// One more matching record exists beyond this page.
+			hasMore = true
+			break
+		}
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("iterate events: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("commit list: %w", err)
+	}
+	return events, hasMore, nil
+}
+
+// CompareInstants compares two normalized UTC timestamps (fixed-width head,
+// optional fraction of any length, trailing Z) by the instant they denote,
+// returning -1, 0 or 1. Fractions are compared as decimal values, so trailing
+// zeros carry no weight and different writings of one instant compare equal.
+func CompareInstants(a, b string) int {
+	aHead, aFraction := splitInstant(a)
+	bHead, bFraction := splitInstant(b)
+	if aHead != bHead {
+		if aHead < bHead {
+			return -1
+		}
+		return 1
+	}
+	if len(aFraction) < len(bFraction) {
+		aFraction += strings.Repeat("0", len(bFraction)-len(aFraction))
+	} else if len(bFraction) < len(aFraction) {
+		bFraction += strings.Repeat("0", len(aFraction)-len(bFraction))
+	}
+	return strings.Compare(aFraction, bFraction)
+}
+
+// splitInstant separates a normalized UTC timestamp into its fixed-width
+// second head and its fraction digits (empty when there is no fraction).
+func splitInstant(s string) (head, fraction string) {
+	const headLen = len("2006-01-02T15:04:05")
+	if len(s) > headLen+1 && s[headLen] == '.' {
+		return s[:headLen], s[headLen+1 : len(s)-1]
+	}
+	return s[:headLen], ""
+}
+
 // computeHash hashes the compact JSON array
 // [seq, account, operation, resource, result, occurred_at, prev_hash] encoded
 // as UTF-8. Strings escape only the double quote, the backslash and control
