@@ -175,6 +175,11 @@ func (s *Store) VerifyChain() (VerifyResult, error) {
 		if err := rows.Scan(&e.Seq, &e.Account, &e.Operation, &e.Resource, &e.Result, &e.OccurredAt, &e.PrevHash, &e.Hash); err != nil {
 			return VerifyResult{}, fmt.Errorf("scan event: %w", err)
 		}
+		if readFaultHook != nil {
+			if err := readFaultHook(int(checked + 1)); err != nil {
+				return VerifyResult{}, fmt.Errorf("read event: %w", err)
+			}
+		}
 		checked++
 		if e.Seq != expected {
 			return VerifyResult{Valid: false, Checked: checked, FirstInvalidSeq: &expected}, nil
@@ -244,10 +249,19 @@ func (s *Store) ListEvents(f EventFilter) ([]Event, error) {
 	defer rows.Close()
 
 	events := []Event{}
+	var scanned int64
 	for rows.Next() && int64(len(events)) <= f.Limit {
 		var e Event
 		if err := rows.Scan(&e.Seq, &e.Account, &e.Operation, &e.Resource, &e.Result, &e.OccurredAt, &e.PrevHash, &e.Hash); err != nil {
 			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		scanned++
+		if readFaultHook != nil {
+			// A fault here lands after a valid prefix was scanned but before
+			// the page is assembled, so no prefix can leak into the response.
+			if err := readFaultHook(int(scanned)); err != nil {
+				return nil, fmt.Errorf("read event: %w", err)
+			}
 		}
 		if f.From != nil && CompareInstants(e.OccurredAt, *f.From) < 0 {
 			continue
