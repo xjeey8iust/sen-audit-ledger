@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -40,8 +41,9 @@ type EventInput struct {
 
 // Append failures the API maps to specific status codes.
 var (
-	ErrSeqConflict = errors.New("seq already exists in the ledger")
-	ErrSeqGap      = errors.New("seq is not the next sequence number")
+	ErrSeqConflict   = errors.New("seq already exists in the ledger")
+	ErrSeqGap        = errors.New("seq is not the next sequence number")
+	ErrCorruptRecord = errors.New("a stored audit record is corrupt")
 )
 
 // genesisPrevHash is the prev_hash of the first record in the chain.
@@ -223,18 +225,6 @@ func (s *Store) ListEvents(f EventFilter) ([]Event, error) {
 		query += " AND account = ?"
 		args = append(args, *f.Account)
 	}
-	// The second prefix is a conservative prefilter only: a record at or
-	// after From keeps a second prefix no smaller than From's, and a record
-	// before To keeps one no larger than To's. The exact instant check below
-	// decides, so fractional seconds of any length stay in the comparison.
-	if f.From != nil {
-		query += " AND substr(occurred_at, 1, 19) >= ?"
-		args = append(args, secondPrefix(*f.From))
-	}
-	if f.To != nil {
-		query += " AND substr(occurred_at, 1, 19) <= ?"
-		args = append(args, secondPrefix(*f.To))
-	}
 	query += " ORDER BY seq ASC"
 
 	rows, err := tx.Query(query, args...)
@@ -249,11 +239,25 @@ func (s *Store) ListEvents(f EventFilter) ([]Event, error) {
 		if err := rows.Scan(&e.Seq, &e.Account, &e.Operation, &e.Resource, &e.Result, &e.OccurredAt, &e.PrevHash, &e.Hash); err != nil {
 			return nil, fmt.Errorf("scan event: %w", err)
 		}
-		if f.From != nil && CompareInstants(e.OccurredAt, *f.From) < 0 {
-			continue
-		}
-		if f.To != nil && CompareInstants(e.OccurredAt, *f.To) >= 0 {
-			continue
+		// The exact window is decided in Go against the actual instant.
+		// When a bound is set, every candidate's stored occurred_at must
+		// name an instant in the same canonical UTC shape the append entry
+		// produces: an empty, truncated or otherwise malformed value can
+		// never fall inside or outside the window, so the whole request
+		// fails as a storage error instead of silently skipping the record
+		// (or returning a page built from a string comparison). Queries
+		// without a time window never normalize and read stored text as is.
+		if f.From != nil || f.To != nil {
+			normalized, ok := NormalizeOccurredAt(e.OccurredAt)
+			if !ok {
+				return nil, fmt.Errorf("seq %d occurred_at: %w", e.Seq, ErrCorruptRecord)
+			}
+			if f.From != nil && CompareInstants(normalized, *f.From) < 0 {
+				continue
+			}
+			if f.To != nil && CompareInstants(normalized, *f.To) >= 0 {
+				continue
+			}
 		}
 		events = append(events, e)
 	}
@@ -273,16 +277,17 @@ func (s *Store) ListEvents(f EventFilter) ([]Event, error) {
 // instant they denote. Fractional seconds of any length participate: the
 // shorter fraction is right-padded with zeros, so ".5" and ".50" are equal
 // while ".5001" sorts after both. Different spellings of one instant compare
-// equal because both values are already normalized to UTC.
+// equal because both values are already normalized to UTC. Both arguments
+// must be in the canonical form NormalizeOccurredAt returns.
 func CompareInstants(a, b string) int {
-	aSec, bSec := secondPrefix(a), secondPrefix(b)
+	aSec, bSec := instantSecond(a), instantSecond(b)
 	if aSec != bSec {
 		if aSec < bSec {
 			return -1
 		}
 		return 1
 	}
-	aFrac, bFrac := fractionDigits(a), fractionDigits(b)
+	aFrac, bFrac := instantFraction(a), instantFraction(b)
 	if len(aFrac) < len(bFrac) {
 		aFrac += strings.Repeat("0", len(bFrac)-len(aFrac))
 	} else {
@@ -291,22 +296,106 @@ func CompareInstants(a, b string) int {
 	return strings.Compare(aFrac, bFrac)
 }
 
-// secondPrefix returns the fixed-width "YYYY-MM-DDTHH:MM:SS" head of a
+// instantSecond returns the fixed-width "YYYY-MM-DDTHH:MM:SS" head of a
 // normalized UTC occurred_at value. The head is zero-padded, so lexicographic
 // order on it matches chronological order.
-func secondPrefix(value string) string {
+func instantSecond(value string) string {
 	return value[:len("2006-01-02T15:04:05")]
 }
 
-// fractionDigits returns the fractional-second digits of a normalized UTC
+// instantFraction returns the fractional-second digits of a normalized UTC
 // occurred_at value, or "" when the value carries no fraction.
-func fractionDigits(value string) string {
+func instantFraction(value string) string {
 	rest := value[len("2006-01-02T15:04:05"):]
 	if rest == "Z" {
 		return ""
 	}
 	return rest[1 : len(rest)-1] // strip the leading "." and trailing "Z"
 }
+
+// NormalizeOccurredAt parses a strict RFC3339 timestamp carrying an explicit
+// timezone, rejects leap seconds, and returns the UTC form keeping the
+// fractional-second digits exactly as supplied. It is the single shape both
+// the append entry and a windowed read accept, so a value that fails to round
+// trip through it is treated as corrupt rather than compared as raw text.
+func NormalizeOccurredAt(value string) (string, bool) {
+	const headLen = len("2006-01-02T15:04:05")
+	if len(value) < headLen+1 {
+		return "", false
+	}
+	head := value[:headLen]
+	if head[4] != '-' || head[7] != '-' || head[10] != 'T' || head[13] != ':' || head[16] != ':' {
+		return "", false
+	}
+	field := func(start, width int) (int, bool) {
+		v := 0
+		for i := start; i < start+width; i++ {
+			if head[i] < '0' || head[i] > '9' {
+				return 0, false
+			}
+			v = v*10 + int(head[i]-'0')
+		}
+		return v, true
+	}
+	year, ok1 := field(0, 4)
+	month, ok2 := field(5, 2)
+	day, ok3 := field(8, 2)
+	hour, ok4 := field(11, 2)
+	minute, ok5 := field(14, 2)
+	second, ok6 := field(17, 2)
+	if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 {
+		return "", false
+	}
+	if second > 59 {
+		// Leap seconds are not accepted.
+		return "", false
+	}
+
+	rest := value[headLen:]
+	fraction := ""
+	if strings.HasPrefix(rest, ".") {
+		i := 1
+		for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
+			i++
+		}
+		if i == 1 {
+			return "", false
+		}
+		fraction = rest[:i]
+		rest = rest[i:]
+	}
+
+	offsetMinutes := 0
+	switch {
+	case rest == "Z":
+	case len(rest) == 6 && (rest[0] == '+' || rest[0] == '-') && rest[3] == ':' &&
+		isASCIIDigit(rest[1]) && isASCIIDigit(rest[2]) && isASCIIDigit(rest[4]) && isASCIIDigit(rest[5]):
+		oh := int(rest[1]-'0')*10 + int(rest[2]-'0')
+		om := int(rest[4]-'0')*10 + int(rest[5]-'0')
+		if oh > 23 || om > 59 {
+			return "", false
+		}
+		offsetMinutes = oh*60 + om
+		if rest[0] == '-' {
+			offsetMinutes = -offsetMinutes
+		}
+	default:
+		return "", false
+	}
+
+	t := time.Date(year, time.Month(month), day, hour, minute, second, 0, time.UTC)
+	if t.Year() != year || int(t.Month()) != month || t.Day() != day || t.Hour() != hour || t.Minute() != minute {
+		return "", false
+	}
+	utc := t.Add(time.Duration(-offsetMinutes) * time.Minute)
+	if utc.Year() < 0 || utc.Year() > 9999 {
+		// The UTC form must stay a four-digit RFC3339 year.
+		return "", false
+	}
+	return utc.Format("2006-01-02T15:04:05") + fraction + "Z", true
+}
+
+func isASCIIDigit(b byte) bool { return b >= '0' && b <= '9' }
 
 // computeHash hashes the compact JSON array
 // [seq, account, operation, resource, result, occurred_at, prev_hash] encoded

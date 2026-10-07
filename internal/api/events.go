@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
@@ -240,87 +239,11 @@ func isUintLiteral(s string) bool {
 	return true
 }
 
-// normalizeOccurredAt parses a strict RFC3339 timestamp with an explicit
-// timezone, rejects leap seconds, and returns the UTC form keeping the
-// fractional-second digits exactly as supplied.
+// normalizeOccurredAt delegates to the store package so the append entry and
+// a windowed read accept one canonical UTC timestamp shape.
 func normalizeOccurredAt(value string) (string, bool) {
-	const headLen = len("2006-01-02T15:04:05")
-	if len(value) < headLen+1 {
-		return "", false
-	}
-	head := value[:headLen]
-	if head[4] != '-' || head[7] != '-' || head[10] != 'T' || head[13] != ':' || head[16] != ':' {
-		return "", false
-	}
-	field := func(start, width int) (int, bool) {
-		v := 0
-		for i := start; i < start+width; i++ {
-			if head[i] < '0' || head[i] > '9' {
-				return 0, false
-			}
-			v = v*10 + int(head[i]-'0')
-		}
-		return v, true
-	}
-	year, ok1 := field(0, 4)
-	month, ok2 := field(5, 2)
-	day, ok3 := field(8, 2)
-	hour, ok4 := field(11, 2)
-	minute, ok5 := field(14, 2)
-	second, ok6 := field(17, 2)
-	if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 {
-		return "", false
-	}
-	if second > 59 {
-		// Leap seconds are not accepted.
-		return "", false
-	}
-
-	rest := value[headLen:]
-	fraction := ""
-	if strings.HasPrefix(rest, ".") {
-		i := 1
-		for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
-			i++
-		}
-		if i == 1 {
-			return "", false
-		}
-		fraction = rest[:i]
-		rest = rest[i:]
-	}
-
-	offsetMinutes := 0
-	switch {
-	case rest == "Z":
-	case len(rest) == 6 && (rest[0] == '+' || rest[0] == '-') && rest[3] == ':' &&
-		isDigit(rest[1]) && isDigit(rest[2]) && isDigit(rest[4]) && isDigit(rest[5]):
-		oh := int(rest[1]-'0')*10 + int(rest[2]-'0')
-		om := int(rest[4]-'0')*10 + int(rest[5]-'0')
-		if oh > 23 || om > 59 {
-			return "", false
-		}
-		offsetMinutes = oh*60 + om
-		if rest[0] == '-' {
-			offsetMinutes = -offsetMinutes
-		}
-	default:
-		return "", false
-	}
-
-	t := time.Date(year, time.Month(month), day, hour, minute, second, 0, time.UTC)
-	if t.Year() != year || int(t.Month()) != month || t.Day() != day || t.Hour() != hour || t.Minute() != minute {
-		return "", false
-	}
-	utc := t.Add(time.Duration(-offsetMinutes) * time.Minute)
-	if utc.Year() < 0 || utc.Year() > 9999 {
-		// The UTC form must stay a four-digit RFC3339 year.
-		return "", false
-	}
-	return utc.Format("2006-01-02T15:04:05") + fraction + "Z", true
+	return store.NormalizeOccurredAt(value)
 }
-
-func isDigit(b byte) bool { return b >= '0' && b <= '9' }
 
 func writeError(c *gin.Context, status int, code, message string) {
 	c.JSON(status, gin.H{"error": gin.H{"code": code, "message": message}})
