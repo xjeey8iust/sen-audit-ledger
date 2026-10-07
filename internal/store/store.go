@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -209,7 +210,11 @@ type EventFilter struct {
 // read-only transaction, so the page reflects one committed view; records
 // appended afterwards are visible to later pages, never to this one. At most
 // Limit+1 matching records are returned: a result longer than Limit means
-// more matches exist past the page. Listing never mutates records.
+// more matches exist past the page. When a time window applies, every
+// occurred_at the scan reads must be a UTC value in the shape the append
+// path persists; anything else is a storage anomaly and fails the whole
+// read rather than being skipped or compared leniently. Listing never
+// mutates records.
 func (s *Store) ListEvents(f EventFilter) ([]Event, error) {
 	tx, err := s.db.BeginTx(context.TODO(), &sql.TxOptions{ReadOnly: true})
 	if err != nil {
@@ -222,18 +227,6 @@ func (s *Store) ListEvents(f EventFilter) ([]Event, error) {
 	if f.Account != nil {
 		query += " AND account = ?"
 		args = append(args, *f.Account)
-	}
-	// The second prefix is a conservative prefilter only: a record at or
-	// after From keeps a second prefix no smaller than From's, and a record
-	// before To keeps one no larger than To's. The exact instant check below
-	// decides, so fractional seconds of any length stay in the comparison.
-	if f.From != nil {
-		query += " AND substr(occurred_at, 1, 19) >= ?"
-		args = append(args, secondPrefix(*f.From))
-	}
-	if f.To != nil {
-		query += " AND substr(occurred_at, 1, 19) <= ?"
-		args = append(args, secondPrefix(*f.To))
 	}
 	query += " ORDER BY seq ASC"
 
@@ -248,6 +241,13 @@ func (s *Store) ListEvents(f EventFilter) ([]Event, error) {
 		var e Event
 		if err := rows.Scan(&e.Seq, &e.Account, &e.Operation, &e.Resource, &e.Result, &e.OccurredAt, &e.PrevHash, &e.Hash); err != nil {
 			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		if (f.From != nil || f.To != nil) && !isStoredInstant(e.OccurredAt) {
+			// A windowed query compares instants, so every occurred_at it
+			// reads must be a UTC value in the shape the append path
+			// persists. Anything else is a storage anomaly, not a record
+			// to skip or to compare leniently.
+			return nil, fmt.Errorf("stored occurred_at is not a persisted UTC instant")
 		}
 		if f.From != nil && CompareInstants(e.OccurredAt, *f.From) < 0 {
 			continue
@@ -289,6 +289,59 @@ func CompareInstants(a, b string) int {
 		bFrac += strings.Repeat("0", len(aFrac)-len(bFrac))
 	}
 	return strings.Compare(aFrac, bFrac)
+}
+
+// isStoredInstant reports whether value is a UTC occurred_at in the exact
+// shape the append path persists: a valid zero-padded
+// "YYYY-MM-DDTHH:MM:SS" head, an optional fractional second of one or more
+// digits, and a trailing "Z". Anything else — empty, truncated, missing the
+// zone, an impossible date or a non-numeric fraction — can never have come
+// from a validated append.
+func isStoredInstant(value string) bool {
+	const headLen = len("2006-01-02T15:04:05")
+	if len(value) < headLen+1 {
+		return false
+	}
+	head := value[:headLen]
+	if head[4] != '-' || head[7] != '-' || head[10] != 'T' || head[13] != ':' || head[16] != ':' {
+		return false
+	}
+	field := func(start, width int) (int, bool) {
+		v := 0
+		for i := start; i < start+width; i++ {
+			if head[i] < '0' || head[i] > '9' {
+				return 0, false
+			}
+			v = v*10 + int(head[i]-'0')
+		}
+		return v, true
+	}
+	year, ok1 := field(0, 4)
+	month, ok2 := field(5, 2)
+	day, ok3 := field(8, 2)
+	hour, ok4 := field(11, 2)
+	minute, ok5 := field(14, 2)
+	second, ok6 := field(17, 2)
+	if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 || second > 59 {
+		return false
+	}
+	t := time.Date(year, time.Month(month), day, hour, minute, second, 0, time.UTC)
+	if t.Year() != year || int(t.Month()) != month || t.Day() != day || t.Hour() != hour || t.Minute() != minute {
+		return false
+	}
+	rest := value[headLen:]
+	if rest == "Z" {
+		return true
+	}
+	if len(rest) < 3 || rest[0] != '.' || rest[len(rest)-1] != 'Z' {
+		return false
+	}
+	for i := 1; i < len(rest)-1; i++ {
+		if rest[i] < '0' || rest[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // secondPrefix returns the fixed-width "YYYY-MM-DDTHH:MM:SS" head of a

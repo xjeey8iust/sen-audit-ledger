@@ -63,7 +63,7 @@ func combinedSeeds() []combinedSeed {
 		{" carol", "2026-10-05T12:30:00Z", false},
 		{"carol ", "2026-10-05T13:30:00Z", false},
 		{"  carol  ", "2026-10-05T14:30:00Z", false},
-		{combinedAccount, "2026-10-06T00:00:00Z", false},                // exactly at to: excluded
+		{combinedAccount, "2026-10-06T00:00:00Z", false},                 // exactly at to: excluded
 		{combinedAccount, "2026-10-04T23:59:59.999999999999999Z", false}, // just before from
 		{combinedAccount, "2026-10-06T00:00:00.000000000000001Z", false}, // just after to
 		{combinedAccount, "2026-10-04T12:00:00Z", false},
@@ -464,11 +464,11 @@ func TestGetEventsCombinedRejectsInvalidInput(t *testing.T) {
 	cases := []string{
 		"account=carol&account=carol&from=2026-10-05T00:00:00Z&to=2026-10-06T00:00:00Z", // repeated parameter
 		"account=carol&from=2026-10-05T00:00:00Z&to=2026-10-06T00:00:00Z&limit=1&limit=1",
-		"account=carol&from=2026-10-06T00:00:00Z&to=2026-10-05T00:00:00Z",                // from after to
-		"account=carol&from=2026-10-05T00:00:00Z&to=2026-10-05T00:00:00Z",                // empty window
-		"account=carol&from=2026-10-05T08:00:00%2B08:00&to=2026-10-05T00:00:00Z",         // same instant
-		"account=carol&from=2026-10-05T00:00:00Z&to=2026-10-06T00:00:00Z&limit=0",        // below range
-		"account=carol&from=2026-10-05T00:00:00Z&to=2026-10-06T00:00:00Z&limit=101",      // above range
+		"account=carol&from=2026-10-06T00:00:00Z&to=2026-10-05T00:00:00Z",           // from after to
+		"account=carol&from=2026-10-05T00:00:00Z&to=2026-10-05T00:00:00Z",           // empty window
+		"account=carol&from=2026-10-05T08:00:00%2B08:00&to=2026-10-05T00:00:00Z",    // same instant
+		"account=carol&from=2026-10-05T00:00:00Z&to=2026-10-06T00:00:00Z&limit=0",   // below range
+		"account=carol&from=2026-10-05T00:00:00Z&to=2026-10-06T00:00:00Z&limit=101", // above range
 		"account=carol&from=2026-10-05T00:00:00Z&to=2026-10-06T00:00:00Z&after_seq=-1",
 		"account=carol&from=2026-10-05T00:00:00Z&to=2026-10-06T00:00:00Z&after_seq=9223372036854775808",
 	}
