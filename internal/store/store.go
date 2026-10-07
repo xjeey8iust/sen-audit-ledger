@@ -177,6 +177,11 @@ func (s *Store) VerifyChain() (VerifyResult, error) {
 			return VerifyResult{}, fmt.Errorf("scan event: %w", err)
 		}
 		checked++
+		// Test seam: an installed row hook observes each scanned row before
+		// the chain checks run. Always nil in the service; see verify_hook.go.
+		if hook := verifyRowHook.Load(); hook != nil {
+			(*hook)(e.Seq)
+		}
 		if e.Seq != expected {
 			return VerifyResult{Valid: false, Checked: checked, FirstInvalidSeq: &expected}, nil
 		}
